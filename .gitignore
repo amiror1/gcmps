@@ -1,0 +1,4 @@
+# outputs that the scripts regenerate
+results/
+logs/
+*.jls
