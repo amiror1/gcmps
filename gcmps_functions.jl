@@ -36,7 +36,7 @@ Globals the functions read (set by the caller before use):
 using TensorKit
 using Zygote
 using OptimKit
-using LinearAlgebra: eigvals
+using LinearAlgebra: eigvals, eigen
 
 """
     compute_TM(F, Ja⁺, Jb⁺)
@@ -57,15 +57,43 @@ function compute_TM(F, Ja⁺, Jb⁺; id = virtual_identity)
     return TM
 end
 
+# ℙ_q t: keep only the block of `t` (a map on the doubled ket ⊗ bra space) with
+# coupled charge q = q_ket - q_bra, zero the others
+function project_sector(t, q)
+    P = Zygote.ignore_derivatives() do
+        P = zeros(ComplexF64, codomain(t), domain(t))
+        for (c, b) in blocks(P)
+            c == U1Irrep(q) && (block(P, c) .= one(b))
+        end
+        P
+    end
+    return P*t 
+end
+
+"""
+    exp_neutral(Δx, TM)
+
+ℙ₀ e^{Δx TM}: the transfer matrix over a distance Δx restricted to the neutral
+sector q = q_ket - q_bra = 0. Every trace of the state goes through it.
+
+Why: the bond charge is the electric field E, a physical degree of freedom, so
+components of the state with different E are orthogonal. The q ≠ 0 blocks of
+e^{L TM} are overlaps of a ket and a bra with different E and must not enter
+⟨Ψ|Ψ⟩. TM, F ⊗ 1̄, J ⊗ J̄ and every local operator here keep q, so one ℙ₀
+per trace is enough. Only the q = 0 block is exponentiated (the others are zeroed
+first, their exponential is trivial).
+"""
+exp_neutral(Δx, TM) = project_sector(exp(Δx*project_sector(TM, 0)), 0)
+
 """
     compute_norm(F, Ja⁺, Jb⁺)
 
 Norm ⟨Ψ|Ψ⟩ of the cMPS on a ring of length `Lovera` (periodic boundary
-conditions): `tr(exp(Lovera * TM))`.
+conditions): `tr(ℙ₀ exp(Lovera * TM))`, see `exp_neutral`.
 """
 function compute_norm(F, Ja⁺, Jb⁺)
     TM = compute_TM(F, Ja⁺, Jb⁺)
-    return tr(exp(Lovera*TM))
+    return tr(exp_neutral(Lovera, TM))
 end
 
 # largest real part of the eigenvalues of a (square) transfer matrix
@@ -109,13 +137,14 @@ end
 """
     compute_ring_density(F, Ja⁺, Jb⁺)
 
-The normalised ring transfer matrix ρ = exp(Lovera*TM) / tr(exp(Lovera*TM)), so a
-local expectation value is ⟨O⟩ = tr(O ρ) (see `ring_expectation`). Computing it
-once and passing it on (`ρ` keyword of the observables) avoids repeating the
-eigenvalues and the exponential for every term.
+The normalised ring transfer matrix ρ = ℙ₀ exp(Lovera*TM) / tr(ℙ₀ exp(Lovera*TM))
+(neutral sector only, see `exp_neutral`), so a local expectation value is
+⟨O⟩ = tr(O ρ) (see `ring_expectation`). Computing it once and passing it on
+(`ρ` keyword of the observables) avoids repeating the eigenvalues and the
+exponential for every term.
 """
 function compute_ring_density(F, Ja⁺, Jb⁺)
-    expLTM = exp(Lovera*compute_shifted_TM(F, Ja⁺, Jb⁺))   # shifted so it cannot overflow
+    expLTM = exp_neutral(Lovera, compute_shifted_TM(F, Ja⁺, Jb⁺))   # shifted so it cannot overflow
     return expLTM/tr(expLTM)
 end
 
@@ -194,10 +223,39 @@ function compute_particle_density(F, Ja⁺, Jb⁺; ρ = compute_ring_density(F, 
     return output
 end
 
+# Energy density (× a²) split into its terms, for the optimisation monitors: kinetic,
+# electric (ga)²⟨E²⟩, contact repulsion c⟨ψ†ψ†ψψ⟩ (both species) and the regulator
+# penalty; `commutator` is ⟨[Ja⁺,Jb⁺]†[Ja⁺,Jb⁺]⟩ itself, so the penalty is
+# regulator_weight * commutator. ρ (compute_ring_density) is shared by all terms.
+function energy_parts(x, ga, c, regulator_weight; ρ = compute_ring_density(x...))
+    e(; ga = 0., c = 0., regulator = 0.) = real(compute_a_squared_energy_density(x...; ga = ga, c = c, regulator = regulator, ρ = ρ))
+    kinetic = e()
+    electric = e(ga = ga) - kinetic
+    contact = e(c = c) - kinetic
+    commutator = e(regulator = 1.) - kinetic
+    return (; kinetic, electric, contact, commutator, penalty = regulator_weight*commutator,
+              total = kinetic + electric + contact + regulator_weight*commutator)
+end
+
+# Weight of each sector q = q_ket - q_bra of the ring transfer matrix e^{L·TM} before the
+# projection ℙ₀ (see exp_neutral): |tr ℙ_q e^{L·TM}|, normalised to sum to 1, sorted by q.
+# The weight in q ≠ 0 is what ℙ₀ removes from the traces.
+function TM_charge_weights(F, Ja⁺, Jb⁺)
+    expLTM = exp(Lovera*compute_shifted_TM(F, Ja⁺, Jb⁺))   # shifted so it cannot overflow
+    weights = [Int(s.charge) => abs(tr(b)) for (s, b) in blocks(expLTM)]
+    total = sum(last, weights)
+    return sort([q => w/total for (q, w) in weights], by = first)
+end
+
+# sectors q = q_ket - q_bra of the transfer matrix on bond space V, sorted (as TM_charge_weights)
+TM_charges(V) = sort(unique(Int(s.charge) - Int(t.charge) for s in sectors(V), t in sectors(V)))
+
 """
-    compute_dimensionless_effective_energy_density(F, Ja⁺, Jb⁺; ga = 0., c = 0., strategy = :grand_canonical, μ = 0., λ = 10., Na = 1., Nb = Na)
+    compute_dimensionless_effective_energy_density(F, Ja⁺, Jb⁺; ga = 0., c = 0., regulator = 200., strategy = :grand_canonical, μ = 0., λ = 10., Na = 1., Nb = Na)
 
 Cost function for the optimisation, per unit length like the energy density.
+`ga`, `c` and `regulator` (weight of the [Ja⁺, Jb⁺] penalty) are passed on to
+`compute_a_squared_energy_density`.
 `strategy` selects how the particle number is controlled (n = na + nb is the
 particle density × a):
 
@@ -212,9 +270,9 @@ particle density × a):
   in the units of the energy density: as a total energy, L·E_eff = E_total +
   λ⟨(N̂a - Na)²⟩ + λ⟨(N̂b - Nb)²⟩, so λ is independent of the ring length.
 """
-function compute_dimensionless_effective_energy_density(F, Ja⁺, Jb⁺; ga = 0., c = 0., strategy = :grand_canonical, μ = 0., λ = 10., Na = 1., Nb = Na)
+function compute_dimensionless_effective_energy_density(F, Ja⁺, Jb⁺; ga = 0., c = 0., regulator = 200., strategy = :grand_canonical, μ = 0., λ = 10., Na = 1., Nb = Na)
     if strategy == :number_variance
-        E = compute_a_squared_energy_density(F, Ja⁺, Jb⁺; ga = ga, c = c)
+        E = compute_a_squared_energy_density(F, Ja⁺, Jb⁺; ga = ga, c = c, regulator = regulator)
         Na_mean, Na²_mean = compute_number_moments(F, Ja⁺, Jb⁺, Ja⁺)
         # The ansatz forces Na = Nb (the bond charge Na - Nb returns to itself around
         # the ring), so the moments of b equal those of a: with equal targets the b term
@@ -227,7 +285,7 @@ function compute_dimensionless_effective_energy_density(F, Ja⁺, Jb⁺; ga = 0.
     end
 
     ρ = compute_ring_density(F, Ja⁺, Jb⁺)   # shared by energy and density
-    E = compute_a_squared_energy_density(F, Ja⁺, Jb⁺; ga = ga, c = c, ρ = ρ)
+    E = compute_a_squared_energy_density(F, Ja⁺, Jb⁺; ga = ga, c = c, regulator = regulator, ρ = ρ)
     n = compute_particle_density(F, Ja⁺, Jb⁺; ρ = ρ)
 
     strategy == :grand_canonical && return E - μ*n
@@ -241,26 +299,102 @@ end
 single-particle correlator of species a, ⟨ψa†(Δx) ψa(0)⟩, on the
 ring. `Ja⁺` is inserted in the ket at one point and in the bra at a point a
 distance `Δxovera` (= Δx/a) away.
-"""
-function dimensionless_two_point_function_a_a_times_L(F, Ja⁺, Jb⁺, Δxovera)
-    TM = compute_shifted_TM(F, Ja⁺, Jb⁺)   # shifted so exp(L*TM) cannot overflow
-    norm_state = tr(exp(Lovera*TM))
 
-    return @tensor Ja⁺[1,4,3]*conj(Ja⁺[6,4,7])*exp(Δxovera*TM)[3,2,5,6]*exp((Lovera-Δxovera)*TM)[5,7,1,2]/norm_state
+Outside that segment the state is in the neutral sector (ℙ₀, see `exp_neutral`);
+inside it the ket carries one more unit of E, q = +1, so this is the correlator
+with a flux string between the two points (the bare ⟨ψa†ψa⟩ vanishes).
+"""
+dimensionless_two_point_function_a_a_times_L(F, Ja⁺, Jb⁺, Δxovera::Real) =
+    only(dimensionless_two_point_function_a_a_times_L(F, Ja⁺, Jb⁺, [Δxovera]))
+
+"""
+    dimensionless_two_point_function_a_a_times_L(F, Ja⁺, Jb⁺, Δxs::AbstractVector)
+
+The same correlator at every distance in `Δxs` (in units of a), as a vector. What does not
+depend on Δx, the shifted transfer matrix and the norm, is computed once, and of e^{Δx TM}
+only the two blocks that enter are exponentiated: the sector q = +1 over the segment
+(ket one unit of E above the bra) and the neutral sector q = 0 over the rest of the ring.
+Not differentiable with Zygote (it fills blocks in place); it is only used for observables.
+"""
+function dimensionless_two_point_function_a_a_times_L(F, Ja⁺, Jb⁺, Δxs::AbstractVector)
+    TM = compute_shifted_TM(F, Ja⁺, Jb⁺)   # shifted so exp(L*TM) cannot overflow
+    T₀ = block(TM, U1Irrep(0))             # neutral sector, the rest of the ring
+    T₁ = block(TM, U1Irrep(1))             # sector q = +1, the Δx segment
+    norm_state = tr(exp(Lovera*T₀))        # tr ℙ₀ e^{L TM}, as in compute_norm
+    return map(Δxs) do Δx
+        E_segment = _sector_map(TM, 1, exp(Δx*T₁))
+        E_rest = _sector_map(TM, 0, exp((Lovera - Δx)*T₀))
+        @tensor Ja⁺[1,4,3]*conj(Ja⁺[6,4,7])*E_segment[3,2,5,6]*E_rest[5,7,1,2]/norm_state
+    end
+end
+
+# A map on the doubled ket ⊗ bra space shaped like `TM`, with the matrix `M` as its block of
+# coupled charge q = q_ket - q_bra and all other blocks zero
+function _sector_map(TM, q, M)
+    t = zeros(eltype(M), codomain(TM), domain(TM))
+    block(t, U1Irrep(q)) .= M
+    return t
 end
 
 """
     dimensionless_density_density_a(F, Ja⁺, Jb⁺, Δxovera)
 
 Density-density correlator of species a, ⟨na(Δx) na(0)⟩ (times a²), on the ring:
-`tr(N e^{Δx TM} N e^{(L-Δx) TM}) / tr(e^{L TM})` with N = Ja⁺ ⊗ conj(Ja⁺) the density
-operator. For Δx > 0 this is ⟨ψa†(Δx) ψa†(0) ψa(0) ψa(Δx)⟩; as Δx → 0 it tends to
-⟨ψa†ψa†ψaψa⟩ (`compute_a_pair_density`), without the contact term na δ(Δx).
+`tr(N e^{Δx TM} N ℙ₀ e^{(L-Δx) TM}) / tr(ℙ₀ e^{L TM})` with N = Ja⁺ ⊗ conj(Ja⁺) the
+density operator (ℙ₀ as in `exp_neutral`). For Δx > 0 this is
+⟨ψa†(Δx) ψa†(0) ψa(0) ψa(Δx)⟩; as Δx → 0 it tends to ⟨ψa†ψa†ψaψa⟩
+(`compute_a_pair_density`), without the contact term na δ(Δx).
 """
 function dimensionless_density_density_a(F, Ja⁺, Jb⁺, Δxovera)
     TM = compute_shifted_TM(F, Ja⁺, Jb⁺)   # shifted so exp(L*TM) cannot overflow
     @tensor N[-1,-2;-3,-4] := Ja⁺[-1,1,-3]*conj(Ja⁺[-2,1,-4])
-    return tr(N*exp(Δxovera*TM)*N*exp((Lovera-Δxovera)*TM))/tr(exp(Lovera*TM))
+    return tr(N*exp(Δxovera*TM)*N*exp_neutral(Lovera - Δxovera, TM))/tr(exp_neutral(Lovera, TM))
+end
+
+"""
+    neutral_fixed_point(TM)
+
+|r)(l| / (l|r) on the neutral block q = 0 (zero elsewhere), with r and l the right and
+left eigenvectors of the leading eigenvalue of `TM`: the limit L → ∞ of the ring
+density ℙ₀ e^{L TM} / tr(ℙ₀ e^{L TM}) (`compute_ring_density`), i.e. the environment
+of local insertions in an infinite system.
+"""
+function neutral_fixed_point(TM)
+    T0 = block(TM, U1Irrep(0))
+    vals, R = eigen(T0)
+    valsl, Lv = eigen(Matrix(T0'))
+    r = R[:, argmax(real.(vals))]
+    l = Lv[:, argmax(real.(valsl))]
+    P = zeros(ComplexF64, codomain(TM), domain(TM))
+    block(P, U1Irrep(0)) .= r*l' ./ (l'*r)
+    return P
+end
+
+"""
+    momentum_distribution_a(F, Ja⁺, Jb⁺, ps)
+
+Momentum distribution of species a, n(p) = ∫ dx e^{-ipx} ⟨ψa†(x) ψa(0)⟩, at each p in
+`ps` (units of 1/a), normalised as ∫ dp/2π n(p) = na. Computed for the infinite
+system (L → ∞, environment `neutral_fixed_point`), so p is continuous.
+
+For x > 0 the correlator is (l| Ja⁺ e^{x TM} J̄a |r) as in
+`dimensionless_two_point_function_a_a_times_L` (flux string between the points), and
+for x < 0 its complex conjugate, so the x integral is a resolvent:
+
+    n(p) = 2 Re ∫₀^∞ dx e^{-ipx} (l| Ja⁺ e^{x TM} J̄a |r) = 2 Re (l| Ja⁺ (ip - TM)⁻¹ J̄a |r)
+
+It converges because between the insertions the state is in q = ±1, where every
+eigenvalue of the shifted TM has negative real part (gap 1/ξ, `correlation_length`).
+No grid in x, so the large-p tail n(p) → C/p⁴ (Tan's contact C) is resolved.
+"""
+function momentum_distribution_a(F, Ja⁺, Jb⁺, ps)
+    TM = compute_shifted_TM(F, Ja⁺, Jb⁺)
+    P  = neutral_fixed_point(TM)
+    𝟙  = id(domain(TM))
+    return map(ps) do p
+        G = inv(im*p*𝟙 - TM)
+        2*real(@tensor Ja⁺[1,4,3]*conj(Ja⁺[6,4,7])*G[3,2,5,6]*P[5,7,1,2])
+    end
 end
 
 """
@@ -273,16 +407,6 @@ expectation of J² ⊗ conj(J)², as in the repulsion term of
 function compute_a_pair_density(F, Ja⁺, Jb⁺, J; ρ = compute_ring_density(F, Ja⁺, Jb⁺))
     @tensor pair[-1,-2;-3,-4] := J[-1,1,3]*J[3,2,-3]*conj(J[-2,1,4])*conj(J[4,2,-4])
     return ring_expectation(pair, ρ)
-end
-
-# ℙ_q t: keep only the block of `t` (a map on the doubled ket ⊗ bra space) with
-# coupled charge q = q_ket - q_bra, zero the others
-function project_sector(t, q)
-    P = zeros(ComplexF64, codomain(t), domain(t))
-    for (c, b) in blocks(P)
-        c == U1Irrep(q) && (block(P, c) .= one(b))
-    end
-    return P*t
 end
 
 """
@@ -299,15 +423,14 @@ J̄a raises the bra charge by 1, so between x and y the state is in sector -1, a
 J̄b brings it back to 0. The trace is cyclic, so e^{T(L-y)} and e^{Tx} merge into
 e^{T(L-Δx)} and the result depends only on Δx.
 
-Note the normalisation is the neutral sector only, tr[ℙ₀ e^{TL}], not the full
-trace `compute_norm` uses.
+The normalisation is the neutral sector, tr[ℙ₀ e^{TL}] (`compute_norm`).
 """
 function dimensionless_a_W_b_function(F, Ja⁺, Jb⁺, Δxovera)
     TM = compute_shifted_TM(F, Ja⁺, Jb⁺)   # shifted so exp(L*TM) cannot overflow
-    norm_state = tr(project_sector(exp(Lovera*TM), 0))
+    norm_state = tr(exp_neutral(Lovera, TM))
 
     E_string = project_sector(exp(Δxovera*TM), -1)            # x → y, inside the flux string
-    E_rest   = project_sector(exp((Lovera-Δxovera)*TM), 0)    # y → x around the ring
+    E_rest   = exp_neutral(Lovera - Δxovera, TM)              # y → x around the ring
     # joins the physical legs of J̄a (charge +1) and J̄b (charge -1); total charge 0
     w = ones(ComplexF64, U₁Space(1 => 1) ⊗ U₁Space(-1 => 1))
 
@@ -348,7 +471,9 @@ The integral over Δ is exact with one matrix exponential (Van Loan's trick):
 
     exp(L [T N; 0 T]) = [e^{LT}  ∫₀^L e^{(L-s)T} N e^{sT} ds;  0  e^{LT}]
 
-so tr(N · upper-right block) / tr(e^{LT}) = ∫₀^L dΔ ⟨:n(Δ) n(0):⟩. The 2×2 block
+so tr(N · upper-right block) / tr(e^{LT}) = ∫₀^L dΔ ⟨:n(Δ) n(0):⟩. All traces are
+in the neutral sector (ℙ₀, see `exp_neutral`); the auxiliary space has trivial
+charge, so ℙ₀ acts on it as the identity. The 2×2 block
 structure is a 2-dim auxiliary space; one exponential per species is cheaper than
 one with a 3-dim space for both (16 vs 27 in units of one exponential). Numerical
 quadrature of `dimensionless_density_density_a` (e.g. QuadGK) gives the same integral,
@@ -359,8 +484,8 @@ function compute_number_moments(F, Ja⁺, Jb⁺, J)
     @tensor N[-1,-2;-3,-4] := J[-1,1,-3]*conj(J[-2,1,-4])
     A, E12, E21, E11 = Zygote.ignore_derivatives(() ->
         (U₁Space(0 => 2), _aux_unit(1, 2), _aux_unit(2, 1), _aux_unit(1, 1)))
-    X = exp(Lovera*(TM ⊗ id(A) + N ⊗ E12))
-    norm_state = real(tr(X*(id(domain(TM)) ⊗ E11)))     # tr e^{LT}
+    X = exp_neutral(Lovera, TM ⊗ id(A) + N ⊗ E12)
+    norm_state = real(tr(X*(id(domain(TM)) ⊗ E11)))     # tr ℙ₀ e^{LT}
     N_mean = Lovera*real(tr(X*(N ⊗ E11)))/norm_state     # L ⟨n⟩ = L tr(N e^{LT})/tr
     pair   = real(tr(X*(N ⊗ E21)))/norm_state            # ∫₀^L dΔ ⟨:n(Δ)n(0):⟩
     
@@ -480,7 +605,7 @@ kick_J(x; scale = 0.1) = (x[1],
                           x[3] + scale*randn(ComplexF64, codomain(x[3]), domain(x[3])))
 
 """
-    embed_state(x, V_big; noise = 1e-3)
+    embed_state(x, V_big; noise = 1e-2)
 
 Embed a converged state `x = (F, Ja⁺, Jb⁺)` on a small bond space into the
 larger bond space `V_big` (which must contain every charge sector of the small
@@ -488,7 +613,7 @@ one with at least the same degeneracy; an error otherwise). The old blocks go in
 the top-left corner, everything else gets noise of size `noise`, so the new state
 starts (almost) exactly at the old one and the optimiser can only improve on it.
 """
-function embed_state(x, V_big; noise = 1e-3)
+function embed_state(x, V_big; noise = 1e-2)
     V_small = domain(x[1])[1]
     for s in sectors(V_small)
         dim(V_big, s) >= dim(V_small, s) || error("embed_state: the new bond space must contain the old one, " *

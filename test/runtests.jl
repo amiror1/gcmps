@@ -59,7 +59,7 @@ end
 function density_a(F, Ja⁺, Jb⁺)
     TM = compute_TM(F, Ja⁺, Jb⁺)
     @tensor tmp[-1,-2;-3,-4] := Ja⁺[-1,1,-3]*conj(Ja⁺[-2,1,-4])
-    return tr(tmp*exp(Lovera*TM))/compute_norm(F, Ja⁺, Jb⁺)
+    return tr(tmp*exp_neutral(Lovera, TM))/compute_norm(F, Ja⁺, Jb⁺)
 end
 
 
@@ -92,7 +92,7 @@ end
 
         norm_state = compute_norm(x...)
         E = compute_a_squared_energy_density(x...; ga = 1.)
-        n = compute_a_particle_density(x...)
+        n = compute_particle_density(x...)
 
         # expectation values of Hermitian operators: real up to rounding
         @test abs(imag(norm_state)) < 1e-10*abs(norm_state)
@@ -108,9 +108,48 @@ end
         @test dimensionless_two_point_function_a_a_times_L(x..., 0.) ≈ density_a(x...) rtol = 1e-8
     end
 
+    #=
+    TM keeps q = q_ket - q_bra, so it commutes with every sector projector ℙ_q.
+    exp_neutral and the correlators rely on this: projecting after the exponential,
+    exponentiating the projected TM, or exponentiating only the block must agree.
+    =#
+    @testset "sector projectors commute with the transfer matrix" begin
+        Random.seed!(4)
+        setup_globals!(V6, 10.)
+        TM = compute_TM(random_tensors(V6; scale = 0.3)...)
+        one_TM = id(domain(TM))
+        ℙ(q) = project_sector(one_TM, q)
+        qs = sort([c.charge for c in blocksectors(TM)])
+        Δx = 2.
+
+        @test qs == collect(-2:2)                     # V6 has charges -1..1
+        @test sum(ℙ(q) for q in qs) ≈ one_TM
+        for q in qs
+            @test ℙ(q)*ℙ(q) ≈ ℙ(q)
+            @test ℙ(q)*TM ≈ TM*ℙ(q)
+            for q′ in qs
+                q′ == q || @test norm(ℙ(q)*TM*ℙ(q′)) < 1e-12
+            end
+            # ℙ e^T is the same wherever ℙ goes, as long as one ℙ is outside the exponential
+            P, T = ℙ(q), Δx*TM
+            E = P*exp(T)
+            @test E ≈ exp(T)*P
+            @test E ≈ P*exp(T)*P
+            @test E ≈ P*exp(P*T)
+            @test E ≈ exp(P*T)*P
+            @test E ≈ P*exp(T*P)
+            @test E ≈ P*exp(P*T*P)*P
+            @test E ≈ project_sector(exp(Δx*project_sector(TM, q)), q)   # as in exp_neutral
+            @test E ≈ _sector_map(TM, q, exp(Δx*block(TM, U1Irrep(q))))
+            # without the outer ℙ the other sectors give e^0 = 1, not 0
+            @test exp(P*T) ≈ E + (one_TM - P)
+        end
+        @test exp_neutral(Lovera, TM) ≈ project_sector(exp(Lovera*TM), 0)
+    end
+
     @testset "gradient matches finite difference ($(kw.strategy))" for kw in [
             (strategy = :grand_canonical, ga = 2.5, μ = 5.),
-            (strategy = :fixed_density,   ga = 2.5, N = 0.5, λ = 10.)]
+            (strategy = :number_variance, ga = 2.5, Na = 5., λ = 10.)]
         Random.seed!(3)
         setup_globals!(V6, 10.)
         x = random_tensors(V6; scale = 0.3)
@@ -132,54 +171,50 @@ end
         @test_throws ErrorException compute_dimensionless_effective_energy_density(x...; strategy = :typo)
     end
 
+    # the regulator keyword reaches the energy: E_eff changes by regulator × ⟨[Ja⁺,Jb⁺]†[Ja⁺,Jb⁺]⟩
+    @testset "regulator weight reaches the cost ($(strategy))" for strategy in [:grand_canonical, :number_variance]
+        Random.seed!(6)
+        setup_globals!(V6, 10.)
+        x = random_tensors(V6; scale = 0.3)
+        cost(; kw...) = real(compute_dimensionless_effective_energy_density(x...; strategy = strategy, μ = 1., Na = 5., kw...))
+        commutator = energy_parts(x, 0., 0., 1.).commutator
+
+        @test cost(regulator = 50.) - cost(regulator = 0.) ≈ 50*commutator rtol = 1e-8
+        @test cost() ≈ cost(regulator = 200.)                       # the default
+    end
+
     #=
-    The two strategies should give the same ground state.
-
-    At the fixed-density optimum the penalty acts as μ_eff = 2λ(N - n). So if the
-    grand-canonical run at μ gives density n_gc, the fixed-density run with
-        N = n_gc + μ/(2λ)
-    has its minimum at exactly the same state (not only for large λ).
-
-    Small setup so it runs quickly: D = 3, L/a = 10, and (ga, μ) = (1, 3), which
-    has a non-empty ground state (n ≈ 0.06). Both runs start from the same random
-    tensors, so the fixed-density run has to find the state on its own.
+    Number moments used by :number_variance, against direct evaluation:
+        ⟨N̂⟩  = L na
+        ⟨N̂²⟩ = L ∫₀^L dΔ ⟨:na(Δ) na(0):⟩ + ⟨N̂⟩
+    with the integral done by Simpson's rule on dimensionless_density_density_a
+    instead of the Van Loan exponential. The ansatz forces Na = Nb, which the
+    :number_variance shortcut for equal targets relies on.
     =#
-    @testset "grand canonical and fixed density agree" begin
-        Random.seed!(1)
-        V3 = U₁Space(-1 => 1, 0 => 1, 1 => 1)
-        setup_globals!(V3, 10.)
-        x0 = random_tensors(V3)
+    @testset "number moments match direct integration" begin
+        Random.seed!(5)
+        setup_globals!(V6, 10.)
+        x = random_tensors(V6; scale = 0.3)
+        Na_mean, Na²_mean = compute_number_moments(x..., x[2])
+        Nb_mean, Nb²_mean = compute_number_moments(x..., x[3])
 
-        ga, μ, λ = 1., 3., 10.
-        alg = LBFGS(20; verbosity = 0, gradtol = 1e-8, maxiter = 3000)
+        @test Na_mean ≈ Lovera*real(density_a(x...)) rtol = 1e-8
+        @test Na²_mean - Na_mean^2 > 0                # Var(N̂a)
 
-        x_gc, _ = optimize(x->fg(x...; strategy = :grand_canonical, ga = ga, μ = μ), x0, alg)
-        n_gc = real(compute_a_particle_density(x_gc...))
-        E_gc = real(compute_a_squared_energy_density(x_gc...; ga = ga))
+        Δs = range(0, Lovera, length = 401)
+        w = [1; repeat([4, 2], 199); 4; 1]            # Simpson weights
+        g = [real(dimensionless_density_density_a(x..., Δ)) for Δ in Δs]
+        @test Na²_mean ≈ Lovera*step(Δs)/3*sum(w .* g) + Na_mean rtol = 1e-6
 
-        # make sure we're not comparing two empty (vacuum) states
-        @test n_gc > 0.01
-
-        N = n_gc + μ/(2λ)
-        x_fd, _ = optimize(x->fg(x...; strategy = :fixed_density, ga = ga, N = N, λ = λ), x0, alg)
-        n_fd = real(compute_a_particle_density(x_fd...))
-        E_fd = real(compute_a_squared_energy_density(x_fd...; ga = ga))
-
-        @test n_fd ≈ n_gc rtol = 1e-6
-        @test E_fd ≈ E_gc rtol = 1e-6
-        @test 2λ*(N - n_fd) ≈ μ rtol = 1e-6       # recovered chemical potential
-
-        # the tensors themselves are only fixed up to a gauge, so compare observables
-        for Δx in (0.5, 2., 5.)
-            @test dimensionless_two_point_function_a_a_times_L(x_fd..., Δx) ≈
-                  dimensionless_two_point_function_a_a_times_L(x_gc..., Δx) atol = 1e-8
-        end
+        @test Nb_mean ≈ Na_mean rtol = 1e-8
+        @test Nb²_mean ≈ Na²_mean rtol = 1e-8
     end
 
     #=
     L-BFGS vs gradient descent: from the same start and with the same iteration
     budget, L-BFGS should (1) actually converge and (2) reach a cost at least as
-    low as gradient descent. Same small setup as the test above.
+    low as gradient descent. Small setup so it runs quickly: D = 3, L/a = 10 and
+    (ga, μ) = (1, 3), which has a non-empty ground state.
     =#
     @testset "L-BFGS converges and beats gradient descent" begin
         Random.seed!(1)
