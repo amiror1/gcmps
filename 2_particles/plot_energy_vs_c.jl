@@ -23,13 +23,16 @@ Ntol = 1e-5                          # stop the multiplier updates once |⟨N⟩
 # ([R_a, R_b] = 0 holds by construction, so there is no regularity penalty any more)
 cs = range(0.1, 50.0; length = 10)  # couplings for the CMPS runs (dimensionless)
 
-# bond dimensions to compare: (D, qmax) = D virtual states in each U(1) charge
-# sector q = -qmax, ..., qmax of ONE copy of V, so the bond dimension per copy is
-# Dt = D (2qmax + 1). The auxiliary space V ⊗ V has dimension Dt², L*T is Dt⁴ × Dt⁴ and
-# exp(L*T) costs O(Dt¹²). One cost + gradient evaluation takes roughly (measured):
-#   (1,2): Dt = 5   ~0.1 s      (2,1): Dt = 6   ~0.4 s
-#   (3,1): Dt = 9   ~20 s       (2,2): Dt = 10  ~25 s   ← too slow for a scan
-Ds = [(1,1), (2,1)]
+# virtual spaces V (ONE copy) to compare: charge q => number of virtual states in
+# that sector. The bond dimension per copy is Dt = dim(V); the auxiliary space V ⊗ V
+# has dimension Dt², L*T is Dt⁴ × Dt⁴ and exp(L*T) costs O(Dt¹²). One cost + gradient
+# evaluation takes roughly (measured, D states in each of the sectors -qmax … qmax):
+#   Dt = 5 ~0.1 s,  Dt = 6 ~0.4 s,  Dt = 9 ~20 s,  Dt = 10 ~25 s  ← too slow for a scan
+Vs = [U1Space(-1 => 1, 0 => 1, 1 => 1),    # Dt = 3
+      U1Space(-1 => 1, 0 => 2, 1 => 1)]    # Dt = 4
+
+# short label for a virtual space, e.g. "-1=>1, 0=>2, 1=>1", charges in increasing order
+sector_label(V) = join(["$(c.charge)=>$(dim(V, c))" for c in sort(collect(sectors(V)); by = c -> c.charge)], ", ")
 
 alg_stage = LBFGS(20; maxiter = 500, gradtol = 1e-3, verbosity = 1)    # multiplier stages: cheap and loose
 alg       = LBFGS(20; maxiter = 10000, gradtol = 1e-4, verbosity = 1)  # final run, at the converged multiplier
@@ -39,12 +42,12 @@ alg       = LBFGS(20; maxiter = 10000, gradtol = 1e-4, verbosity = 1)  # final r
 # ---------------------------------------------------------------------------
 # Within a scan, the optimum for one c is used as the starting point for the
 # next c ("warm start"), which is usually much faster than a new random state.
-E_cmps = Dict{Tuple{Int,Int}, Vector{typeof(1.0u"m^-1")}}()
+E_cmps = Dict{eltype(Vs), Vector{typeof(1.0u"m^-1")}}()
 
-for (D, qmax) in Ds
-    println("\n=== bond dimension: D = $D per charge sector, charges -$qmax … $qmax (per copy of V) ===")
+for V in Vs
+    println("\n=== virtual space (per copy of V): ", sector_label(V), "   (Dt = ", dim(V), ") ===")
     Random.seed!(1234)                     # reproducible random initial state
-    ψ  = rand_CMPS(D, qmax, L)
+    ψ  = rand_CMPS(V, L)
     Es = typeof(1.0u"m^-1")[]
     for c in cs
         H = LiebLiniger(m, c, L)
@@ -56,7 +59,7 @@ for (D, qmax) in Ds
                 "   ⟨N_a⟩ = ", round(N_a; digits = 6), "   ⟨N_b⟩ = ", round(N_b; digits = 6),
                 "   ν = ", ν, "   ‖∇‖ = ", gnorm)
     end
-    E_cmps[(D, qmax)] = Es
+    E_cmps[V] = Es
 end
 
 # ---------------------------------------------------------------------------
@@ -89,9 +92,9 @@ plt = plot(cs_fine, E_exact; label = "exact (Bethe ansatz)", color = :black, lin
                                   maximum(maximum(ustrip.(u"m^-1", Es)) for Es in values(E_cmps)))))
 plot!(plt, cs_fine, E_bog; label = "Bogoliubov", color = :gray, linestyle = :dash, linewidth = 2)
 plot!(plt, cs_fine, E_bos; label = "1/c (fermionization)", color = :gray, linestyle = :dot, linewidth = 2)
-for ((D, qmax), marker) in zip(Ds, (:circle, :diamond, :square, :utriangle))
-    scatter!(plt, cs, ustrip.(u"m^-1", E_cmps[(D, qmax)]);
-             label = "CMPS (V⊗V), D = $D per charge, q = -$qmax…$qmax", marker = marker)
+for (V, marker) in zip(Vs, (:circle, :diamond, :square, :utriangle))
+    scatter!(plt, cs, ustrip.(u"m^-1", E_cmps[V]);
+             label = "CMPS (V⊗V), V: " * sector_label(V), marker = marker)
 end
 
 savefig(plt, "energy_vs_c.png")

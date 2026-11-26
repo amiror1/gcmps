@@ -289,7 +289,7 @@ function rand_CMPS(V::U1Space, L; T = ComplexF64)
 end
 
 # Random CMPS with D virtual states in each charge sector -qmax, ..., qmax (of one copy of V)
-rand_CMPS(D::Integer, qmax::Integer, L; T = ComplexF64) =
+rand_CMPS(qmax::Integer, D::Integer, L; T = ComplexF64) =
     rand_CMPS(U1Space(q => D for q in -qmax:qmax), L; T = T)
 
 # One copy V of the virtual space
