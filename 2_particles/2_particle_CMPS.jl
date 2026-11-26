@@ -212,17 +212,72 @@ would kill every term containing an R_a.)
 
 If D = dim(V), the auxiliary space has dimension D², while R_a and R_b are only
 D × D matrices.
+
+STORED exp(L*T) AND NORM
+
+Besides F, R_a, R_b and L, a CMPS stores exp(L*T) (the exponential of its
+dimensionless transfer matrix with itself, see transfer_matrix) and the norm
+N = ⟨ψ|ψ⟩ = Tr(exp(L*T)). Every expectation value needs them and computing exp(L*T)
+is by far the most expensive step (O(Dt¹²)), so it is done exactly once per state,
+in the constructor. Rules that keep this consistent:
+
+  * The constructor CMPS(F, R_a, R_b, L) is the only public way to build a CMPS, and
+    it always computes exp(L*T) and N from the tensors. (The other inner
+    constructor, with the TRUSTED token, takes them as given; it is only for
+    operations that know them exactly without an exp, such as α * ψ.)
+  * The struct is immutable, so changing a tensor means building a new CMPS.
+  * NEVER mutate the tensors of a CMPS in place (ψ.F .+= ..., rmul!(ψ.R_a, 2), ...):
+    exp(L*T) and N would then describe a different state, silently.
+
+Automatic differentiation: building the CMPS INSIDE the function that Zygote
+differentiates (as the cost functions of the optimisation do) makes Zygote follow the
+gradient through the constructor, so expectation values that read ψ.expLT and ψ.N
+have the correct gradient with respect to F, R_a and R_b. A CMPS built OUTSIDE the
+differentiated function must not be used inside it: its exp(L*T) would be a
+constant for Zygote, and the gradient would be silently wrong.
 =#
 
 const Pp1 = U1Space(1 => 1)    # charge +1 leg
 const Pm1 = U1Space(-1 => 1)   # charge -1 leg
 
-# F (4 legs) and R_a, R_b (3 legs) are tensors of different type, hence two type parameters
-struct CMPS{TF<:AbstractTensorMap, TR<:AbstractTensorMap}
+# token for the inner constructor that takes exp(L*T) and N as given (see above)
+struct Trusted end
+const TRUSTED = Trusted()
+
+# F (4 legs), R_a, R_b (3 legs) and exp(L*T) (8 legs) are tensors of different type,
+# hence three type parameters
+struct CMPS{TF<:AbstractTensorMap, TR<:AbstractTensorMap, TE<:AbstractTensorMap}
     F::TF
     R_a::TR
     R_b::TR
     L::Unitful.Length   # length of the circle, in any length unit (e.g. 10u"m", 2.5u"μm")
+    expLT::TE           # exp(L*T), with L*T = transfer_matrix(F, R_a, R_b)
+    N::Float64          # ⟨ψ|ψ⟩ = Tr(exp(L*T)), real and positive
+
+    # the public constructor: exp(L*T) and N are always computed from the tensors
+    function CMPS(F::AbstractTensorMap, R_a::AbstractTensorMap, R_b::AbstractTensorMap,
+                  L::Unitful.Length)
+        expLT = exp(transfer_matrix(F, R_a, R_b))
+        return new{typeof(F), typeof(R_a), typeof(expLT)}(F, R_a, R_b, L, expLT, real(tr(expLT)))
+    end
+
+    # internal: exp(L*T) and N known exactly by the caller (e.g. α * ψ)
+    function CMPS(F::AbstractTensorMap, R_a::AbstractTensorMap, R_b::AbstractTensorMap,
+                  L::Unitful.Length, expLT::AbstractTensorMap, N::Real, ::Trusted)
+        return new{typeof(F), typeof(R_a), typeof(expLT)}(F, R_a, R_b, L, expLT, N)
+    end
+end
+
+# Printing: the tensors (exp(L*T) alone is ~100 MB at Dt = 9) are not shown
+function Base.show(io::IO, ψ::CMPS)
+    print(io, "CMPS(V = ", virtualspace(ψ), ", L = ", ψ.L, ")")
+end
+function Base.show(io::IO, ::MIME"text/plain", ψ::CMPS)
+    V = virtualspace(ψ)
+    println(io, "CMPS on V ⊗ V, two boson species (a, b)")
+    println(io, "  V (one copy) = ", V, "   (Dt = ", dim(V), ")")
+    println(io, "  L            = ", ψ.L)
+    print(io,   "  ⟨ψ|ψ⟩        = ", ψ.N)
 end
 
 # Random CMPS on a U(1)-graded virtual space V (one copy), e.g. rand_CMPS(U1Space(-1 => 2, 0 => 4, 1 => 2), 10u"m")
@@ -276,13 +331,17 @@ Base.:-(ψ::CMPS, φ::CMPS) = ψ + (-φ)
 α|ψ⟩: shift F → F + log(α) 𝟙 (𝟙 the identity on V ⊗ V). Since 𝟙 commutes with
 everything and ∫₀ᴸ dx log(α)/L = log(α), this multiplies the state by exp(log(α)) = α.
 The bond dimension does not change. F, R_a and R_b become complex if they were real.
+
+No new exp is needed: L*T contains F⊗𝟙 + 𝟙⊗F̄, so it shifts by
+(log α + conj(log α)) 𝟙 = log|α|² 𝟙, which commutes with everything, hence
+exp(L*T) → |α|² exp(L*T) and N → |α|² N (as it should: ⟨αψ|αψ⟩ = |α|² ⟨ψ|ψ⟩).
 =#
 function Base.:*(α::Number, ψ::CMPS)
     α == 0 && throw(ArgumentError("0 * CMPS is the zero vector, which is not a CMPS"))
     F = ψ.F + log(complex(α)) * e0(virtualspace(ψ))
     R_a = one(scalartype(F)) * ψ.R_a    # promote R_a, R_b to the element type of F
     R_b = one(scalartype(F)) * ψ.R_b
-    return CMPS(F, R_a, R_b, ψ.L)
+    return CMPS(F, R_a, R_b, ψ.L, abs2(α) * ψ.expLT, abs2(α) * ψ.N, TRUSTED)
 end
 Base.:*(ψ::CMPS, α::Number) = α * ψ
 
@@ -300,51 +359,44 @@ L*T : (Vφ⊗Vφ) ⊗ (Vψ⊗Vψ)' ← (Vφ⊗Vφ) ⊗ (Vψ⊗Vψ)', with legs
 [-1 -2 -3 -4; -5 -6 -7 -8]: -1, -2 (out) and -5, -6 (in) are copies 1, 2 of the
 ket, -3, -4 and -7, -8 copies 1, 2 of the bra. ψ and φ may have different bond
 dimensions. Used for ⟨ψ|φ⟩ = Tr(exp(L*T)) (like Julia's dot, the first argument is
-complex conjugated) and, with φ = ψ, for all expectation values (transfer_exp).
-=#
-function transfer_matrix(ψ::CMPS, φ::CMPS)
-    check_length(ψ, φ)
-    Vψ, Vφ = virtualspace(ψ), virtualspace(φ)
-    Iψ, Iφ = e0(Vψ), e0(Vφ)       # identities on Vψ⊗Vψ and Vφ⊗Vφ
-    iψ, iφ = e1(Vψ), e1(Vφ)       # identities on one copy
-    @tensor LT[-1 -2 -3 -4; -5 -6 -7 -8] :=
-        φ.F[-1 -2; -5 -6] * conj(Iψ[-3 -4; -7 -8]) +
-        Iφ[-1 -2; -5 -6]  * conj(ψ.F[-3 -4; -7 -8]) +
-        φ.R_a[-1; 1 -5] * iφ[-2; -6] * conj(ψ.R_a[-3; 1 -7]) * conj(iψ[-4; -8]) +
-        iφ[-1; -5] * φ.R_b[-2; 1 -6] * conj(iψ[-3; -7]) * conj(ψ.R_b[-4; 1 -8])
-    return LT
-end
+complex conjugated).
 
-LinearAlgebra.dot(ψ::CMPS, φ::CMPS) = tr(exp(transfer_matrix(ψ, φ)))
-# ‖ψ‖ = sqrt(⟨ψ|ψ⟩). The max(⋅, 0) guards against a tiny negative ⟨ψ|ψ⟩ from rounding
-# errors when the state is (close to) zero.
-LinearAlgebra.norm(ψ::CMPS) = sqrt(max(real(dot(ψ, ψ)), 0))
-
-# ------------------------------------------------------------------------------
-# exp(L*T) and the norm, shared by all expectation values
-# ------------------------------------------------------------------------------
-#=
-The dimensionless transfer matrix of the state with itself,
+With φ = ψ this is the transfer matrix of the state with itself,
 
     L*T = F⊗𝟙 + 𝟙⊗F̄ + R̃_a⊗conj(R̃_a) + R̃_b⊗conj(R̃_b),   R̃_a = R_a⊗𝟙_V,  R̃_b = 𝟙_V⊗R_b,
 
-L*T : (V⊗V) ⊗ (V⊗V)' ← (V⊗V) ⊗ (V⊗V)', with legs [-1 -2 -3 -4; -5 -6 -7 -8]:
--1, -2 and -5, -6 are copies 1, 2 of the ket, -3, -4 and -7, -8 copies 1, 2 of
-the bra (see transfer_matrix). Returns the pair (exp(L*T), N) with
-N = Tr(exp(L*T)) = ⟨ψ|ψ⟩.
+whose exponential the CMPS constructor stores (ψ.expLT, with ψ.N = Tr exp(L*T)) for
+all expectation values. exp(L*T) is computed exactly (densely): L*T is a
+Dt⁴ × Dt⁴ matrix (block diagonal in the U(1) charge), so this costs O(Dt¹²).
 
-exp(L*T) is computed exactly (densely). L*T is a D⁴ × D⁴ matrix (block diagonal in
-the U(1) charge), so this costs O(D¹²).
-
-The expectation-value functions below take this pair as an optional last argument
-T. Called without it they compute it themselves; inside the optimisation it is
-computed once and passed to all of them, so exp(L*T) (the most expensive step,
-also for Zygote) is evaluated once per cost evaluation instead of twice.
+The form on the raw tensors (ket tensors first, then bra tensors) is what the
+constructor uses, since the CMPS does not exist yet at that point;
+transfer_matrix(F, R_a, R_b) is the transfer matrix of these tensors with themselves.
 =#
-function transfer_exp(ψ::CMPS)
-    expLT = exp(transfer_matrix(ψ, ψ))
-    return expLT, tr(expLT)
+function transfer_matrix(Fφ, R_aφ, R_bφ, Fψ, R_aψ, R_bψ)
+    Vψ, Vφ = codomain(R_aψ)[1], codomain(R_aφ)[1]
+    Iψ, Iφ = e0(Vψ), e0(Vφ)       # identities on Vψ⊗Vψ and Vφ⊗Vφ
+    iψ, iφ = e1(Vψ), e1(Vφ)       # identities on one copy
+    @tensor LT[-1 -2 -3 -4; -5 -6 -7 -8] :=
+        Fφ[-1 -2; -5 -6] * conj(Iψ[-3 -4; -7 -8]) +
+        Iφ[-1 -2; -5 -6] * conj(Fψ[-3 -4; -7 -8]) +
+        R_aφ[-1; 1 -5] * iφ[-2; -6] * conj(R_aψ[-3; 1 -7]) * conj(iψ[-4; -8]) +
+        iφ[-1; -5] * R_bφ[-2; 1 -6] * conj(iψ[-3; -7]) * conj(R_bψ[-4; 1 -8])
+    return LT
 end
+transfer_matrix(F, R_a, R_b) = transfer_matrix(F, R_a, R_b, F, R_a, R_b)
+
+function transfer_matrix(ψ::CMPS, φ::CMPS)
+    check_length(ψ, φ)
+    return transfer_matrix(φ.F, φ.R_a, φ.R_b, ψ.F, ψ.R_a, ψ.R_b)
+end
+
+# ⟨ψ|φ⟩. For φ === ψ it is the stored norm, otherwise a new exp is needed.
+LinearAlgebra.dot(ψ::CMPS, φ::CMPS) =
+    ψ === φ ? complex(ψ.N) : tr(exp(transfer_matrix(ψ, φ)))
+# ‖ψ‖ = sqrt(⟨ψ|ψ⟩), from the stored norm. The max(⋅, 0) guards against a tiny
+# negative ⟨ψ|ψ⟩ from rounding errors when the state is (close to) zero.
+LinearAlgebra.norm(ψ::CMPS) = sqrt(max(ψ.N, 0))
 
 # ------------------------------------------------------------------------------
 # expectation value of the energy
@@ -353,7 +405,7 @@ end
 E = ⟨ψ|H|ψ⟩ / ⟨ψ|ψ⟩ for the two-species Lieb-Liniger Hamiltonian on the circle.
 
 By translation invariance E = L × (energy density). With the dimensionless
-transfer matrix L*T (see transfer_exp), the densities of species σ = a, b are
+transfer matrix L*T (see transfer_matrix), the densities of species σ = a, b are
 
     ⟨∂ψ_σ†∂ψ_σ⟩      = K_σ / L³,   K_σ = Tr(exp(L*T) [F,R̃_σ]⊗conj([F,R̃_σ])) / N
     ⟨ψ_σ†ψ_σ†ψ_σψ_σ⟩ = I_σ / L²,   I_σ = Tr(exp(L*T) R̃_σR̃_σ⊗conj(R̃_σR̃_σ)) / N
@@ -374,13 +426,12 @@ appearing once in the ket and once in the bra. Hence
     E = Σ_σ L [ K_σ/(2m L³) + c I_σ/L² ] = Σ_σ [ K_σ/(2m L²) + c I_σ/L ]
 
 which is a Unitful quantity in units of inverse length (energy, with ħ = 1).
-The optional argument T = (exp(L*T), N) can be passed to reuse a precomputed
-transfer_exp(ψ).
+exp(L*T) and N are the ones stored in ψ, so this costs no exp.
 =#
-function energy(ψ::CMPS, H::LiebLiniger, T = transfer_exp(ψ))
+function energy(ψ::CMPS, H::LiebLiniger)
     L = check_length(ψ, H)
     F, R_a, R_b = ψ.F, ψ.R_a, ψ.R_b
-    expLT, N = T                  # exp(L*T) and the norm ⟨ψ|ψ⟩ = Tr(exp(L*T))
+    expLT, N = ψ.expLT, ψ.N       # exp(L*T) and the norm ⟨ψ|ψ⟩ = Tr(exp(L*T))
 
     # kinetic terms: commutators [F, R_a⊗𝟙] and [F, 𝟙⊗R_b] : V⊗V ← P(±1) ⊗ V⊗V
     @tensor C_a[-1 -2; -3 -4 -5] := F[-1 -2; 1 -5] * R_a[1; -3 -4] - R_a[-1; -3 1] * F[1 -2; -4 -5]
@@ -417,12 +468,11 @@ are dimensionless and do not depend on L explicitly (plain numbers). Returns the
 tuple (⟨N_a⟩, ⟨N_b⟩). By the U(1) symmetry of the CMPS every component of the state
 has N_a = N_b, so the two numbers agree (up to rounding errors).
 R_σ only acts on its own copy of V, so the other copy is traced over in ket and bra.
-The optional argument T = (exp(L*T), N) can be passed to reuse a precomputed
-transfer_exp(ψ).
+exp(L*T) and N are the ones stored in ψ, so this costs no exp.
 =#
-function particle_number(ψ::CMPS, T = transfer_exp(ψ))
+function particle_number(ψ::CMPS)
     R_a, R_b = ψ.R_a, ψ.R_b
-    expLT, N = T                  # exp(L*T) and the norm ⟨ψ|ψ⟩ = Tr(exp(L*T))
+    expLT, N = ψ.expLT, ψ.N       # exp(L*T) and the norm ⟨ψ|ψ⟩ = Tr(exp(L*T))
 
     # Tr(exp(L*T) R̃_σ⊗conj(R̃_σ)): copy 2 traced over for a, copy 1 for b
     @tensor n_a = expLT[1 2 3 4; 5 2 7 4] * R_a[5; 9 1] * conj(R_a[7; 9 3])
@@ -548,41 +598,35 @@ small but finite step. As in Hauru, Van Damme, Haegeman, SciPost Phys. 10, 040 (
 strongly regularised far from the optimum, close to the true metric near convergence.
 (This makes the map mildly nonlinear in g, which works fine in practice.)
 
-The metric depends on the point x (like g_μν(x)), so the M's are rebuilt whenever x
-changes and cached for repeated calls at the same point. It costs one extra
-transfer_exp per iteration, small compared with the several cost evaluations of a
-line search.
+The metric depends on the point (like g_μν(x)) through ρ, so it takes the CMPS ψ at
+that point and uses its stored exp(L*T) and N, like energy and particle_number.
+minimize_cost passes the CMPS that the cost function built at that point, so
+exp(L*T) is not recomputed here.
 =#
-function metric_preconditioner(L::Unitful.Length; δmin = 1e-5, δmax = 1e-1)
-    cache = Ref{Any}(nothing)               # (x, (M_F, M_a, M_b)) at the last point
+function metric_preconditioner(ψ::CMPS, g; δmin = 1e-5, δmax = 1e-1)
     hermitian(M) = (M + M') / 2             # remove rounding asymmetry: M is Hermitian
+    x = (ψ.F, ψ.R_a, ψ.R_b)
 
-    return function (x, g)
-        # one-point metrics at x, from ρ = exp(L*T)/Tr
-        if cache[] === nothing || cache[][1] !== x
-            expLT, N = transfer_exp(CMPS(x..., L))
-            ρ = expLT / N
-            @tensor ρ_a[-1 -2; -3 -4] := ρ[-1 1 -2 2; -3 1 -4 2]    # trace over copy 2
-            @tensor ρ_b[-1 -2; -3 -4] := ρ[1 -1 2 -2; 1 -3 2 -4]    # trace over copy 1
-            M_F = permute(ρ, ((7, 8, 3, 4), (5, 6, 1, 2)))
-            M_a = permute(ρ_a, ((4, 2), (3, 1)))
-            M_b = permute(ρ_b, ((4, 2), (3, 1)))
-            cache[] = (x, map(hermitian, (M_F, M_a, M_b)))
-        end
-        Ms = cache[][2]
+    # one-point metrics at x, from ρ = exp(L*T)/Tr
+    ρ = ψ.expLT / ψ.N
+    @tensor ρ_a[-1 -2; -3 -4] := ρ[-1 1 -2 2; -3 1 -4 2]    # trace over copy 2
+    @tensor ρ_b[-1 -2; -3 -4] := ρ[1 -1 2 -2; 1 -3 2 -4]    # trace over copy 1
+    M_F = permute(ρ, ((7, 8, 3, 4), (5, 6, 1, 2)))
+    M_a = permute(ρ_a, ((4, 2), (3, 1)))
+    M_b = permute(ρ_b, ((4, 2), (3, 1)))
+    Ms = map(hermitian, (M_F, M_a, M_b))
 
-        # regularisation δ, following the size of g (Hauru, Van Damme, Haegeman 2021)
-        δ = clamp(sqrt(param_inner(x, g, g)), δmin, δmax)
-        Minvs = map(M -> inv(M + δ * norm(M, Inf) * id(domain(M))), Ms)
+    # regularisation δ, following the size of g (Hauru, Van Damme, Haegeman 2021)
+    δ = clamp(sqrt(param_inner(x, g, g)), δmin, δmax)
+    Minvs = map(M -> inv(M + δ * norm(M, Inf) * id(domain(M))), Ms)
 
-        # η = (M + δ‖M‖)⁻¹ g for each of F, R_a, R_b. F: regroup g[c1 c2; a1 a2] as a
-        # vector on V⊗V⊗V'⊗V'. R: regroup g[c; p a] as a vector on V ⊗ V' with the
-        # charge leg p as domain. Solve, and regroup back.
-        gF, ga, gb = g
-        ηF = permute(Minvs[1] * permute(gF, ((1, 2, 3, 4), ())), ((1, 2), (3, 4)))
-        ηR(Minv, gi) = permute(Minv * permute(gi, ((1, 3), (2,))), ((1,), (3, 2)))
-        return (ηF, ηR(Minvs[2], ga), ηR(Minvs[3], gb))
-    end
+    # η = (M + δ‖M‖)⁻¹ g for each of F, R_a, R_b. F: regroup g[c1 c2; a1 a2] as a
+    # vector on V⊗V⊗V'⊗V'. R: regroup g[c; p a] as a vector on V ⊗ V' with the
+    # charge leg p as domain. Solve, and regroup back.
+    gF, ga, gb = g
+    ηF = permute(Minvs[1] * permute(gF, ((1, 2, 3, 4), ())), ((1, 2), (3, 4)))
+    ηR(Minv, gi) = permute(Minv * permute(gi, ((1, 3), (2,))), ((1,), (3, 2)))
+    return (ηF, ηR(Minvs[2], ga), ηR(Minvs[3], gb))
 end
 
 #=
@@ -646,13 +690,16 @@ function find_groundstate(ψ0::CMPS, H::LiebLiniger, N_desired::Real;
                           alg = LBFGS(20; maxiter = 1000, gradtol = 1e-8, verbosity = 1))
     L = check_length(ψ0, H)
 
-    # dimensionless cost C as a function of x = (F, R_a, R_b), at fixed multiplier ν
+    # dimensionless cost C as a function of x = (F, R_a, R_b), at fixed multiplier ν.
+    # The CMPS is built here, inside the function Zygote differentiates, so its
+    # exp(L*T) (computed once, shared by all terms) is differentiated too.
+    # Returns (C, ψ): ψ is passed on to the preconditioner (see minimize_cost).
     function cost(x, ν)
         ψ = CMPS(x..., L)
-        T = transfer_exp(ψ)       # exp(L*T) computed once, shared by all terms
-        N_a, N_b = particle_number(ψ, T)
+        N_a, N_b = particle_number(ψ)
         ΔN_a, ΔN_b = N_a - N_desired, N_b - N_desired
-        return ustrip(NoUnits, (energy(ψ, H, T) - ν * (ΔN_a + ΔN_b) + λ * (ΔN_a^2 + ΔN_b^2)) * L)
+        C = ustrip(NoUnits, (energy(ψ, H) - ν * (ΔN_a + ΔN_b) + λ * (ΔN_a^2 + ΔN_b^2)) * L)
+        return C, ψ
     end
 
     # one stage: minimise C at fixed ν, report, and return the state and ⟨N⟩ - N_desired
@@ -683,11 +730,34 @@ Minimise a cost function of the parameters x = (F, R_a, R_b) with OptimKit, usin
 Zygote for the gradient and, if precondition = true, the metric preconditioner.
 Returns the optimised CMPS and the norm of the final gradient (the Euclidean norm
 of Zygote's gradient, also when preconditioning).
+
+cost(x) must return the pair (C, ψ), with C the value to minimise and
+ψ = CMPS(x..., L) the state it built (with its exp(L*T)). Zygote only differentiates
+C; ψ is kept from the last evaluation and passed to the preconditioner, which needs
+exp(L*T) at the same point. OptimKit calls precondition(x, g) with the very x that
+fg was last evaluated at (the tensors are compared with ===), so ψ is normally
+reused; otherwise (e.g. if the line search accepted an earlier point) a new CMPS is
+built. The returned CMPS is obtained the same way.
+
+The points x that OptimKit handles stay tuples of tensors, not CMPS: a CMPS built
+outside fg (e.g. in param_retract) would compute an exp(L*T) that Zygote cannot
+differentiate, and fg would have to compute it again anyway.
 =#
 function minimize_cost(cost, ψ0::CMPS, alg; precondition::Bool = true)
+    L = ψ0.L
+    last = Ref{Any}(ψ0)           # CMPS of the last cost evaluation
+
+    # the CMPS at the point x: the last one evaluated if it was at x, else a new one
+    function state(x)
+        ψ = last[]
+        ψ.F === x[1] && ψ.R_a === x[2] && ψ.R_b === x[3] && return ψ
+        return last[] = CMPS(x..., L)
+    end
+
     # value and gradient, in the form OptimKit expects
     function fg(x)
-        f, grads = Zygote.withgradient(cost, x)
+        (f, ψ), grads = Zygote.withgradient(cost, x)    # gradient of C only
+        last[] = ψ
         g = map((gi, xi) -> gi === nothing ? zero(xi) : gi, grads[1], x)   # `nothing` → zero tensor
         return f, g
     end
@@ -696,8 +766,8 @@ function minimize_cost(cost, ψ0::CMPS, alg; precondition::Bool = true)
                              retract = param_retract, inner = param_inner,
                              scale! = param_scale!, add! = param_add!,
                              transport! = param_transport!,
-                             precondition = precondition ? metric_preconditioner(ψ0.L) :
+                             precondition = precondition ? (x, g) -> metric_preconditioner(state(x), g) :
                                                            (x, g) -> deepcopy(g))
 
-    return CMPS(x..., ψ0.L), sqrt(param_inner(x, g, g))
+    return state(x), sqrt(param_inner(x, g, g))
 end
